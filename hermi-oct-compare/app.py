@@ -4,8 +4,8 @@ import streamlit as st
 
 st.set_page_config(page_title="Hermi vs OCT Stock Tool", layout="wide")
 
-st.title("📊 Hermi vs OCT Stock Comparison")
-st.write("HERMIE-FILE-FOR-OUTFIT-2.xlsx (real qty) aur Untitled-spreadsheet-5.xlsx (OCT qty) ko compare karo.")
+st.title("📊 Hermi vs OCT Stock Comparison (MODEL Pivot)")
+st.write("Hermi real qty vs Odoo OCT qty ko MODEL level pe pivot karke compare karo (sizes/colors auto‑sum).")
 
 # ---------------- FILE UPLOAD ---------------- #
 
@@ -13,25 +13,17 @@ col1, col2 = st.columns(2)
 with col1:
     hermi_file = st.file_uploader("Hermi File (Real Quantity)", type=["xlsx", "xls"], key="hermi")
 with col2:
-    oct_file = st.file_uploader("OCT File (System Quantity)", type=["xlsx", "xls"], key="oct")
+    oct_file = st.file_uploader("Odoo OCT File (System Quantity)", type=["xlsx", "xls"], key="oct")
 
 
 # ---------------- PARSE FUNCTIONS ---------------- #
 
 @st.cache_data
 def parse_hermi_file(uploaded):
-    # Hermi file: header nahi lena, raw data
-    df = pd.read_excel(uploaded, header=None)
+    df = pd.read_excel(uploaded, header=None)  # raw
+    df = df.iloc[1:, :].reset_index(drop=True)  # skip first header row
 
-    # Row 0 = "OUTFIT ITEMS", actual table row 1 se start
-    df = df.iloc[1:, :].reset_index(drop=True)
-
-    # Column indexes (0‑based):
-    # 0: NO
-    # 1: MODEL/SKU
-    # 9: COLOR
-    # 10: STATUS IN SALLA
-    # 11: QTY
+    # Index mapping (0‑based): 1=MODEL/SKU, 9=COLOR, 10=STATUS, 11=QTY
     sku_col_idx = 1
     color_col_idx = 9
     status_col_idx = 10
@@ -40,28 +32,25 @@ def parse_hermi_file(uploaded):
     if df.shape[1] <= qty_col_idx:
         raise ValueError("Hermi file ka structure change ho gaya, expected kam se kam 12 columns (NO..QTY).")
 
-    df["MODEL"] = df[sku_col_idx].astype(str).str.strip()
+    raw_sku = df[sku_col_idx].astype(str).str.strip()
+    df["MODEL"] = raw_sku.str.split("/").str[0].str.strip()
     df["COLOR"] = df[color_col_idx].astype(str).fillna("").str.strip().str.upper()
     df["STATUS"] = df[status_col_idx].astype(str).fillna("").str.strip()
     df["HERMI_QTY"] = pd.to_numeric(df[qty_col_idx], errors="coerce").fillna(0)
 
-    # Empty model rows hatao
     df = df[df["MODEL"] != ""].copy()
 
-    # KEY = MODEL + COLOR
-    df["KEY"] = df["MODEL"] + "__" + df["COLOR"]
-
     grouped = (
-        df.groupby("KEY", as_index=False)
+        df.groupby("MODEL", as_index=False)
         .agg(
             {
-                "MODEL": "first",
-                "COLOR": "first",
+                "COLOR": lambda x: ", ".join(sorted(set([c for c in x if c]))),  # all colors list
                 "STATUS": "first",
                 "HERMI_QTY": "sum",
             }
         )
     )
+    grouped["KEY"] = grouped["MODEL"]
     return grouped
 
 
@@ -69,40 +58,34 @@ def parse_hermi_file(uploaded):
 def parse_oct_file(uploaded):
     df = pd.read_excel(uploaded, header=0)
 
-    # Expect: Display Name | Quantity On Hand
     cols = {str(c).lower().strip(): c for c in df.columns}
     name_col = cols.get("display name") or list(df.columns)[0]
     qty_col = cols.get("quantity on hand") or list(df.columns)[1]
 
     df[name_col] = df[name_col].astype(str).str.strip()
-    df["OCT_QTY_RAW"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+    df["QTY_RAW"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
-    # [DN50001-1/L GRAY] -> MODEL = DN50001-1, COLOR = GRAY
-    def extract_model_color(s):
+    # Pivot: MODEL extract from [MODEL/size] or [MODEL] format
+    def extract_model(s):
         m = re.search(r"\[([^\]]+)\]", s)
         if not m:
-            return None, None
-        inside = m.group(1)          # e.g. "DN50001-1/L GRAY"
-        parts = inside.split()
-        base = parts[0]              # "DN50001-1/L"
-        model = base.split("/")[0]   # "DN50001-1"
-        color = " ".join(parts[1:]).upper() if len(parts) > 1 else ""
-        return model.strip(), color.strip()
+            # kuch rows plain model name ke saath hote hain, jaise "DM836"
+            txt = str(s).strip()
+            if txt and "[" not in txt and "]" not in txt and "/" not in txt and " " not in txt:
+                return txt
+            return None
+        inside = m.group(1)
+        model = inside.split("/")[0]
+        return model.strip()
 
-    df[["MODEL", "COLOR"]] = df[name_col].apply(
-        lambda x: pd.Series(extract_model_color(x))
-    )
-
-    # MODEL missing rows hatao
-    df = df.dropna(subset=["MODEL"])
-    df["COLOR"] = df["COLOR"].fillna("").str.upper()
-
-    df["KEY"] = df["MODEL"].astype(str).str.strip() + "__" + df["COLOR"]
+    df["MODEL"] = df[name_col].apply(extract_model)
+    df = df.dropna(subset=["MODEL"]).copy()
 
     grouped = (
-        df.groupby("KEY", as_index=False)["OCT_QTY_RAW"].sum()
-        .rename(columns={"OCT_QTY_RAW": "OCT_QTY"})
+        df.groupby("MODEL", as_index=False)["QTY_RAW"].sum()
+        .rename(columns={"QTY_RAW": "OCT_QTY"})
     )
+    grouped["KEY"] = grouped["MODEL"]
     return grouped
 
 
@@ -113,62 +96,87 @@ if hermi_file and oct_file:
         hermi_df = parse_hermi_file(hermi_file)
         oct_df = parse_oct_file(oct_file)
 
-        # Outer join taaki dono side ka missing data bhi dikhe
         merged = hermi_df.merge(oct_df, on="KEY", how="outer", suffixes=("_H", "_O"))
 
-        # MODEL / COLOR fill
-        merged["MODEL"] = merged["MODEL"].fillna(merged["MODEL"])
-        merged["COLOR"] = merged["COLOR"].fillna(merged["COLOR"])
+        merged["MODEL"] = merged["MODEL_H"].fillna(merged["MODEL_O"])
+        merged["COLOR"] = merged["COLOR"].fillna("")
+        merged["STATUS"] = merged["STATUS"].fillna("")
 
         merged["HERMI_QTY"] = merged["HERMI_QTY"].fillna(0)
         merged["OCT_QTY"] = merged["OCT_QTY"].fillna(0)
 
-        # Strict 2‑decimal rounding
         merged["HERMI_QTY_R"] = merged["HERMI_QTY"].round(2)
         merged["OCT_QTY_R"] = merged["OCT_QTY"].round(2)
 
         merged["DIFF"] = merged["OCT_QTY_R"] - merged["HERMI_QTY_R"]
-        merged["MATCH"] = merged["DIFF"] == 0
 
-        # Missing flags
+        # % difference (relative to Hermi)
+        merged["PCT_DIFF"] = merged.apply(
+            lambda r: 0 if r["HERMI_QTY_R"] == 0 else (r["DIFF"] / r["HERMI_QTY_R"]) * 100, axis=1
+        ).round(1)
+
+        # Advanced flags
+        merged["MATCH"] = merged["DIFF"] == 0
         merged["ONLY_IN_HERMI"] = (merged["HERMI_QTY_R"] != 0) & (merged["OCT_QTY_R"] == 0)
         merged["ONLY_IN_OCT"] = (merged["OCT_QTY_R"] != 0) & (merged["HERMI_QTY_R"] == 0)
 
-        # STATUS agar Hermi side se aayi ho
-        merged["STATUS"] = merged["STATUS"].fillna("")
+        def severity(row):
+            if row["ONLY_IN_HERMI"]:
+                return "Only in Hermi"
+            if row["ONLY_IN_OCT"]:
+                return "Only in OCT"
+            if row["MATCH"]:
+                return "Perfect"
+            if abs(row["PCT_DIFF"]) <= 5:
+                return "Minor"
+            if abs(row["PCT_DIFF"]) <= 20:
+                return "Medium"
+            return "Major"
+
+        merged["SEVERITY"] = merged.apply(severity, axis=1)
+
         merged["IS_PUBLISHED"] = merged["STATUS"].str.upper().str.contains("PUBLISHED")
 
         # -------- KPIs -------- #
-        total_items = len(merged)
+        total_models = len(merged)
         matched = int(merged["MATCH"].sum())
-        mismatched = int(total_items - matched)
+        major_mismatch = int((merged["SEVERITY"] == "Major").sum())
+        only_hermi_count = int(merged["ONLY_IN_HERMI"].sum())
+        only_oct_count = int(merged["ONLY_IN_OCT"].sum())
         published = int(merged["IS_PUBLISHED"].sum())
-        not_published = int(total_items - published)
 
-        st.subheader("📈 Summary")
+        st.subheader("📈 Summary (MODEL Pivot)")
         k1, k2, k3, k4, k5 = st.columns(5)
-        k1.metric("Total Items", total_items)
-        k2.metric("Matched", matched)
-        k3.metric("Mismatch", mismatched)
-        k4.metric("Match %", f"{(matched/total_items*100):.1f}%" if total_items else "0%")
-        k5.metric("Published", published)
+        k1.metric("Total Models", total_models)
+        k2.metric("Perfect Match", matched)
+        k3.metric("Major Mismatch", major_mismatch)
+        k4.metric("Only in Hermi", only_hermi_count)
+        k5.metric("Only in OCT", only_oct_count)
 
         # -------- Filters -------- #
         st.subheader("🔎 Filter & Search")
-        f1, f2, f3 = st.columns([1, 1, 2])
+        f1, f2, f3, f4 = st.columns([1, 1, 1, 2])
         with f1:
-            status_filter = st.selectbox("Match Filter", ["All", "Matched", "Mismatched"], index=0)
+            match_filter = st.selectbox("Match Filter", ["All", "Perfect", "Minor", "Medium", "Major"])
         with f2:
-            pub_filter = st.selectbox("Publish Filter", ["All", "Published", "Not Published"], index=0)
+            side_filter = st.selectbox("Side Filter", ["All", "Only in Hermi", "Only in OCT"])
         with f3:
-            search_text = st.text_input("Search SKU / Color")
+            pub_filter = st.selectbox("Publish", ["All", "Published", "Not Published"])
+        with f4:
+            search_text = st.text_input("Search MODEL / Color")
 
         df_view = merged.copy()
 
-        if status_filter == "Matched":
-            df_view = df_view[df_view["MATCH"]]
-        elif status_filter == "Mismatched":
-            df_view = df_view[~df_view["MATCH"]]
+        if match_filter != "All":
+            if match_filter == "Perfect":
+                df_view = df_view[df_view["SEVERITY"] == "Perfect"]
+            else:
+                df_view = df_view[df_view["SEVERITY"] == match_filter]
+
+        if side_filter == "Only in Hermi":
+            df_view = df_view[df_view["ONLY_IN_HERMI"]]
+        elif side_filter == "Only in OCT":
+            df_view = df_view[df_view["ONLY_IN_OCT"]]
 
         if pub_filter == "Published":
             df_view = df_view[df_view["IS_PUBLISHED"]]
@@ -182,7 +190,6 @@ if hermi_file and oct_file:
                 | df_view["COLOR"].astype(str).str.lower().str.contains(s)
             ]
 
-        # Final columns for display
         df_view = df_view[
             [
                 "MODEL",
@@ -191,23 +198,24 @@ if hermi_file and oct_file:
                 "HERMI_QTY_R",
                 "OCT_QTY_R",
                 "DIFF",
-                "MATCH",
+                "PCT_DIFF",
+                "SEVERITY",
                 "ONLY_IN_HERMI",
                 "ONLY_IN_OCT",
             ]
         ].rename(
             columns={
-                "MODEL": "SKU",
                 "HERMI_QTY_R": "Hermi Qty",
                 "OCT_QTY_R": "OCT Qty",
-                "DIFF": "Difference",
-                "MATCH": "Match",
+                "DIFF": "Diff",
+                "PCT_DIFF": "% Diff",
+                "SEVERITY": "Severity",
                 "ONLY_IN_HERMI": "Only in Hermi",
                 "ONLY_IN_OCT": "Only in OCT",
             }
         )
 
-        st.subheader("📋 Detailed Comparison")
+        st.subheader("📋 Advanced MODEL Level Pivot View")
 
         def highlight_row(row):
             if row["Only in Hermi"]:
@@ -215,7 +223,14 @@ if hermi_file and oct_file:
             elif row["Only in OCT"]:
                 color = "#cce5ff"   # blue
             else:
-                color = "#d4edda" if row["Match"] else "#f8d7da"
+                if row["Severity"] == "Perfect":
+                    color = "#d4edda"
+                elif row["Severity"] == "Minor":
+                    color = "#e2f0cb"
+                elif row["Severity"] == "Medium":
+                    color = "#ffe8a1"
+                else:
+                    color = "#f8d7da"
             return [f"background-color: {color}"] * len(row)
 
         st.dataframe(df_view.style.apply(highlight_row, axis=1), use_container_width=True)
@@ -226,18 +241,18 @@ if hermi_file and oct_file:
         def to_excel_bytes(df):
             output = BytesIO()
             with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-                df.to_excel(writer, index=False, sheet_name="Comparison")
+                df.to_excel(writer, index=False, sheet_name="Model Pivot")
             return output.getvalue()
 
         excel_bytes = to_excel_bytes(df_view)
         st.download_button(
-            "⬇️ Download Comparison Excel",
+            "⬇️ Download Pivot Report",
             data=excel_bytes,
-            file_name="stock_comparison.xlsx",
+            file_name="model_pivot_stock_comparison.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
     except Exception as e:
         st.error(f"Error: {e}")
 else:
-    st.info("Upar dono files upload karo (Hermi + OCT), phir result yahan dikhega.")
+    st.info("Dono files upload karo: Hermi + Odoo OCT.")
