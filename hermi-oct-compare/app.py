@@ -7,38 +7,59 @@ st.set_page_config(page_title="Hermi vs OCT Stock Tool", layout="wide")
 st.title("📊 Hermi vs OCT Stock Comparison")
 st.write("HERMIE-FILE-FOR-OUTFIT-2.xlsx (real qty) aur Untitled-spreadsheet-5.xlsx (OCT qty) ko compare karo.")
 
-# ---- File upload ----
+# ---------------- FILE UPLOAD ---------------- #
+
 col1, col2 = st.columns(2)
 with col1:
     hermi_file = st.file_uploader("Hermi File (Real Quantity)", type=["xlsx", "xls"], key="hermi")
 with col2:
     oct_file = st.file_uploader("OCT File (System Quantity)", type=["xlsx", "xls"], key="oct")
 
+
+# ---------------- PARSE FUNCTIONS ---------------- #
+
 @st.cache_data
 def parse_hermi_file(uploaded):
     df = pd.read_excel(uploaded)
-    # Expect structure: NO | SKU | S | M | L | XL | 2XL | 3XL | 4XL | COLOR | STATUS IN SALLA | QTY
-    # Important columns:
-    # SKU = column "SKU"
-    # COLOR = column "COLOR" (or similar)
-    # STATUS = column "STATUS IN SALLA"
-    # QTY = column "QTY"
-    # Adjust column names if needed.
-    cols = {c.lower(): c for c in df.columns}
-    sku_col = cols.get("sku")
-    color_col = cols.get("color")
-    status_col = cols.get("status in salla") or cols.get("status")
-    qty_col = cols.get("qty")
 
-    if not all([sku_col, qty_col]):
-        raise ValueError("Hermi file me SKU ya QTY column nahi mila.")
+    # Column names clean karo: lower + strip
+    clean_map = {}
+    for c in df.columns:
+        key = str(c).strip().lower().replace("  ", " ")
+        clean_map[key] = c
+
+    # Tumhari file ka header: NO | SKU | S | M | L | XL | 2XL | 3XL | 4XL | COLOR | STATUS IN SALLA | QTY
+    # Isliye hum yahan smart mapping kar rahe hain:
+    sku_col = (
+        clean_map.get("sku")
+        or clean_map.get("item code")
+        or clean_map.get("model")
+    )
+    qty_col = (
+        clean_map.get("qty")
+        or clean_map.get("quantity")
+        or clean_map.get("total qty")
+    )
+    color_col = (
+        clean_map.get("color")
+        or clean_map.get("colour")
+    )
+    status_col = (
+        clean_map.get("status in salla")
+        or clean_map.get("status")
+    )
+
+    if not sku_col or not qty_col:
+        # Debug ke liye headers dikha do
+        st.write("DEBUG Hermi headers:", list(df.columns))
+        raise ValueError("Hermi file me SKU ya QTY column nahi mila. Header me 'SKU' aur 'QTY' hona chahiye.")
 
     df["SKU_CLEAN"] = df[sku_col].astype(str).str.strip()
     df["COLOR"] = df[color_col].astype(str).str.strip() if color_col else ""
     df["STATUS"] = df[status_col].astype(str).str.strip() if status_col else ""
     df["HERMI_QTY"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
-    # group by SKU (agar same SKU multiple colors/rows ho to yahan aggregate kar sakte ho)
+    # Agar same SKU multiple rows (different color) ho to yahan aggregate ho jayega
     grouped = (
         df.groupby("SKU_CLEAN", as_index=False)
         .agg(
@@ -51,24 +72,26 @@ def parse_hermi_file(uploaded):
     )
     return grouped
 
+
 @st.cache_data
 def parse_oct_file(uploaded):
     df = pd.read_excel(uploaded, header=0)
-    # Expect structure: Display Name | Quantity On Hand
-    cols = {c.lower(): c for c in df.columns}
+
+    # Tumhari OCT file: Display Name | Quantity On Hand
+    cols = {str(c).lower().strip(): c for c in df.columns}
     name_col = cols.get("display name") or list(df.columns)[0]
     qty_col = cols.get("quantity on hand") or list(df.columns)[1]
 
     df[name_col] = df[name_col].astype(str).str.strip()
     df["OCT_QTY_RAW"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
 
-    # Extract [SKU] or [SKU/SIZE] from display name
+    # Extract [SKU] ya [SKU/SIZE]
     def extract_sku(s):
         m = re.search(r"\[([^\]]+)\]", s)
         if not m:
             return None
         sku = m.group(1)
-        # remove /SIZE part => DN50001-1/L -> DN50001-1
+        # DN50001-1/L -> DN50001-1
         sku = sku.split("/")[0]
         return sku.strip()
 
@@ -79,12 +102,15 @@ def parse_oct_file(uploaded):
     grouped.rename(columns={"OCT_QTY_RAW": "OCT_QTY"}, inplace=True)
     return grouped
 
+
+# ---------------- MAIN LOGIC ---------------- #
+
 if hermi_file and oct_file:
     try:
         hermi_df = parse_hermi_file(hermi_file)
         oct_df = parse_oct_file(oct_file)
 
-        # ---- Comparison ----
+        # Merge & compare
         merged = hermi_df.merge(oct_df, on="SKU_CLEAN", how="left")
         merged["OCT_QTY"] = merged["OCT_QTY"].fillna(0)
         merged["DIFF"] = merged["OCT_QTY"] - merged["HERMI_QTY"]
@@ -93,26 +119,28 @@ if hermi_file and oct_file:
         # Published flag
         merged["IS_PUBLISHED"] = merged["STATUS"].str.upper().str.contains("PUBLISHED")
 
-        # ---- KPIs ----
+        # -------- KPIs -------- #
         total_items = len(merged)
-        matched = merged["MATCH"].sum()
-        mismatched = total_items - matched
-        published = merged["IS_PUBLISHED"].sum()
-        not_published = total_items - published
+        matched = int(merged["MATCH"].sum())
+        mismatched = int(total_items - matched)
+        published = int(merged["IS_PUBLISHED"].sum())
+        not_published = int(total_items - published)
 
         st.subheader("📈 Summary")
-        k1, k2, k3, k4 = st.columns(4)
+        k1, k2, k3, k4, k5 = st.columns(5)
         k1.metric("Total Items", total_items)
         k2.metric("Matched", matched)
         k3.metric("Mismatch", mismatched)
-        k4.metric("Published", published)
+        match_percent = f"{(matched/total_items*100):.1f}%" if total_items else "0%"
+        k4.metric("Match %", match_percent)
+        k5.metric("Published", published)
 
-        # ---- Filters ----
+        # -------- Filters -------- #
         st.subheader("🔎 Filter & Search")
         f1, f2, f3 = st.columns([1, 1, 2])
         with f1:
             status_filter = st.selectbox(
-                "Status Filter",
+                "Match Filter",
                 ["All", "Matched", "Mismatched"],
                 index=0,
             )
@@ -144,7 +172,7 @@ if hermi_file and oct_file:
                 | df_view["COLOR"].astype(str).str.lower().str.contains(s)
             ]
 
-        # nicer columns
+        # Columns order
         df_view = df_view[
             [
                 "SKU_CLEAN",
@@ -166,20 +194,18 @@ if hermi_file and oct_file:
         )
 
         st.subheader("📋 Detailed Comparison")
+
+        # Row-wise color: green match, red mismatch
+        def highlight_row(row):
+            color = "#d4edda" if row["Match"] else "#f8d7da"
+            return [f"background-color: {color}"] * len(row)
+
         st.dataframe(
-            df_view.style.apply(
-                lambda row: [
-                    "background-color: #d4edda"
-                    if row["Match"]
-                    else "background-color: #f8d7da"
-                ]
-                * len(row),
-                axis=1,
-            ),
+            df_view.style.apply(highlight_row, axis=1),
             use_container_width=True,
         )
 
-        # ---- Download ----
+        # -------- Download Excel -------- #
         def to_excel_bytes(df):
             from io import BytesIO
 
