@@ -16,28 +16,34 @@ with col2:
 
 @st.cache_data
 def parse_hermi_file(uploaded):
-    # IMPORTANT: header=1  ⇒ second row ko header le (0-indexed)
-    df = pd.read_excel(uploaded, header=1)
+    # Header bilkul na lo, pure raw data
+    df = pd.read_excel(uploaded, header=None)
 
-    # Ab headers proper aayenge: NO, SKU, S, M, ..., COLOR, STATUS IN SALLA, QTY
-    clean_map = {}
-    for c in df.columns:
-        key = str(c).strip().lower().replace("  ", " ")
-        clean_map[key] = c
+    # Row 0 = "OUTFIT ITEMS", actual table row 1 se start
+    df = df.iloc[1:, :].reset_index(drop=True)
 
-    sku_col = clean_map.get("sku")
-    qty_col = clean_map.get("qty")
-    color_col = clean_map.get("color")
-    status_col = clean_map.get("status in salla") or clean_map.get("status")
+    # Column indexes (0‑based):
+    # 0: NO
+    # 1: SKU
+    # 9: COLOR
+    # 10: STATUS IN SALLA
+    # 11: QTY
+    sku_col_idx = 1
+    color_col_idx = 9
+    status_col_idx = 10
+    qty_col_idx = 11
 
-    if not sku_col or not qty_col:
-        st.write("DEBUG Hermi headers:", list(df.columns))
-        raise ValueError("Hermi file me SKU ya QTY column nahi mila. Header row me 'SKU' aur 'QTY' hone chahiye.")
+    # Agar file me columns kam/zyada hue to error de
+    if df.shape[1] <= qty_col_idx:
+        raise ValueError("Hermi file ka structure change ho gaya, expected 12 columns (NO..QTY).")
 
-    df["SKU_CLEAN"] = df[sku_col].astype(str).str.strip()
-    df["COLOR"] = df[color_col].astype(str).str.strip() if color_col else ""
-    df["STATUS"] = df[status_col].astype(str).str.strip() if status_col else ""
-    df["HERMI_QTY"] = pd.to_numeric(df[qty_col], errors="coerce").fillna(0)
+    df["SKU_CLEAN"] = df[sku_col_idx].astype(str).str.strip()
+    df["COLOR"] = df[color_col_idx].astype(str).fillna("").str.strip()
+    df["STATUS"] = df[status_col_idx].astype(str).fillna("").str.strip()
+    df["HERMI_QTY"] = pd.to_numeric(df[qty_col_idx], errors="coerce").fillna(0)
+
+    # Empty SKU rows hata do
+    df = df[df["SKU_CLEAN"] != ""].copy()
 
     grouped = (
         df.groupby("SKU_CLEAN", as_index=False)
